@@ -3,16 +3,16 @@ import RHDHDeployment from "../../utils/authentication-providers/rhdh-deployment
 import { Common, setupBrowser } from "../../utils/common";
 import { UIhelper } from "../../utils/ui-helper";
 import { KeycloakHelper } from "../../utils/authentication-providers/keycloak-helper";
-import { NO_USER_FOUND_IN_CATALOG_ERROR_MESSAGE } from "../../utils/constants"
+import { NO_USER_FOUND_IN_CATALOG_ERROR_MESSAGE } from "../../utils/constants";
 
 let page: Page;
 let context: BrowserContext;
 
-/* SUPORTED RESOLVERS
+/* SUPPORTED RESOLVERS
 OIDC:
     ❗Changed from 1.5
     [x] oidcSubClaimMatchingIdPUserId -> (Default, no setting specified)
-    [x] oidcSubClaimMatchingKeycloakUserId -> (same as above, but need to be set explicitely in the config)
+    [x] oidcSubClaimMatchingKeycloakUserId -> (same as above, but need to be set explicitly in the config)
     [x] preferredUsernameMatchingUserEntityName (patched)
     [x] emailLocalPartMatchingUserEntityName
     [x] emailMatchingUserEntityProfileEmail -> email will always match, just making sure it logs in
@@ -62,7 +62,9 @@ test.describe("Configure OIDC provider (using RHBK)", async () => {
     uiHelper = new UIhelper(page);
 
     // initialize keycloak helper
+    console.log("[TEST] Initializing Keycloak helper...");
     await keycloakHelper.initialize();
+    console.log("[TEST] Keycloak helper initialized successfully");
 
     // expect some expected variables
     expect(process.env.DEFAULT_USER_PASSWORD).toBeDefined();
@@ -84,7 +86,7 @@ test.describe("Configure OIDC provider (using RHBK)", async () => {
     await deployment.generateStaticToken();
 
     // set enviroment variables and create secret
-    if (!process.env.ISRUNNINGLOCAL){
+    if (!process.env.ISRUNNINGLOCAL) {
       deployment.addSecretData("BASE_URL", backstageUrl);
       deployment.addSecretData("BASE_BACKEND_URL", backstageBackendUrl);
     }
@@ -104,12 +106,23 @@ test.describe("Configure OIDC provider (using RHBK)", async () => {
       process.env.RHBK_CLIENT_SECRET,
     );
 
+    deployment.addSecretData(
+      "AUTH_PROVIDERS_GH_ORG_CLIENT_ID",
+      process.env.AUTH_PROVIDERS_GH_ORG_CLIENT_ID,
+    );
+    deployment.addSecretData(
+      "AUTH_PROVIDERS_GH_ORG_CLIENT_SECRET",
+      process.env.AUTH_PROVIDERS_GH_ORG_CLIENT_SECRET,
+    );
+
     await deployment.createSecret();
 
     // create initial deployment
     // enable keycloak login with ingestion
+    console.log("[TEST] Enabling OIDC login with ingestion...");
     await deployment.enableOIDCLoginWithIngestion();
     await deployment.updateAllConfigs();
+    console.log("[TEST] OIDC login with ingestion enabled successfully");
 
     // create backstage deployment and wait for it to be ready
     await deployment.createBackstageDeployment();
@@ -216,7 +229,9 @@ test.describe("Configure OIDC provider (using RHBK)", async () => {
     );
     expect(login2).toBe("Login successful");
 
-    await uiHelper.verifyAlertErrorMessage(NO_USER_FOUND_IN_CATALOG_ERROR_MESSAGE);
+    await uiHelper.verifyAlertErrorMessage(
+      NO_USER_FOUND_IN_CATALOG_ERROR_MESSAGE,
+    );
     await keycloakHelper.initialize();
     await keycloakHelper.clearUserSessions("atena");
   });
@@ -354,6 +369,19 @@ test.describe("Configure OIDC provider (using RHBK)", async () => {
     );
   });
 
+  test(`Ingestion of users and groups with invalid characters: check sanitize[User/Group]NameTransformer`, async () => {
+    expect(
+      await deployment.checkUserIsIngestedInCatalog([
+        "Invalid Username",
+      ]),
+    ).toBe(true);
+    expect(
+      await deployment.checkGroupIsIngestedInCatalog([
+        "invalid@groupname",
+      ]),
+    ).toBe(true);
+  });
+
   test("Ensure Guest login is disabled when setting environment to production", async () => {
     await page.goto("/");
     await uiHelper.verifyHeading("Select a sign-in method");
@@ -363,8 +391,60 @@ test.describe("Configure OIDC provider (using RHBK)", async () => {
     expect(singInMethods).not.toContain("Guest");
   });
 
+  test("Login with OIDC as primary sign in provider and GitHub auth as secondary", async () => {
+    const oidcLogin = await common.keycloakLogin(
+      "zeus",
+      process.env.DEFAULT_USER_PASSWORD,
+    );
+
+    expect(oidcLogin).toBe("Login successful");
+
+    await page.goto("/settings");
+    await uiHelper.verifyHeading("Zeus Giove");
+
+    expect(process.env.AUTH_PROVIDERS_GH_ORG_CLIENT_SECRET).toBeDefined();
+    expect(process.env.AUTH_PROVIDERS_GH_ORG_CLIENT_ID).toBeDefined();
+    // set up GitHub auth
+    deployment.setAppConfigProperty("auth.providers.github", {
+      production: {
+        clientId: "${AUTH_PROVIDERS_GH_ORG_CLIENT_ID}",
+        clientSecret: "${AUTH_PROVIDERS_GH_ORG_CLIENT_SECRET}",
+        callbackUrl:
+          "${BASE_URL:-http://localhost:7007}/api/auth/github/handler/frame",
+      },
+    });
+
+    deployment.setAppConfigProperty(
+      "auth.providers.github.production.disableIdentityResolution",
+      "true",
+    );
+    await deployment.updateAllConfigs();
+    await deployment.restartLocalDeployment();
+    await page.waitForTimeout(3000);
+    await deployment.waitForDeploymentReady();
+
+    // wait for rhdh first sync and portal to be reachable
+    await deployment.waitForSynced();
+
+    const ghLogin = await common.githubLoginFromSettingsPage(
+      "rhdhqeauth1",
+      process.env.AUTH_PROVIDERS_GH_USER_PASSWORD,
+      process.env.AUTH_PROVIDERS_GH_USER_2FA,
+    );
+    expect(ghLogin).toBe("Login successful");
+    // Sign out for GitHub
+    await page.getByTitle("Sign out from GitHub").click();
+
+    // Sign out for OIDC
+    await page.goto("/settings");
+    await uiHelper.verifyHeading("Zeus Giove");
+    await common.signOut();
+    await context.clearCookies();
+  });
+
   test.afterAll(async () => {
-    console.log("Cleaning up...");
+    console.log("[TEST] Starting cleanup...");
     await deployment.killRunningProcess();
+    console.log("[TEST] Cleanup completed");
   });
 });

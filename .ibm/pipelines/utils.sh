@@ -4,8 +4,8 @@
 source "${DIR}/reporting.sh"
 
 export_chart_version() {
-  # change reference to https://raw.githubusercontent.com/redhat-developer/rhdh-chart/refs/heads/main/.rhdh/docs/installing-ci-charts.adoc after RHIDP-6668
-  export CHART_VERSION=$(echo $(curl -sS https://raw.githubusercontent.com/rhdh-bot/openshift-helm-charts/refs/heads/rhdh-1-rhel-9/installation/README.md | grep -oE '[0-9]+\.[0-9]+-[0-9]+-CI'))
+  export CHART_VERSION=$(curl -sSX GET "https://quay.io/api/v1/repository/rhdh/chart/tag/?onlyActiveTags=true&filter_tag_name=like:${CHART_MAJOR_VERSION}-" -H "Content-Type: application/json" \
+  | jq '.tags[0].name' | grep -oE '[0-9]+\.[0-9]+-[0-9]+-CI')
 }
 
 retrieve_pod_logs() {
@@ -50,9 +50,7 @@ droute_send() {
   original_context=$(oc config current-context) # Save original context
   echo "Saving original context: $original_context"
   ( # Open subshell
-    if [ -n "${PULL_NUMBER:-}" ]; then
-      set +e
-    fi
+    set +e
     local droute_version="1.2.2"
     local release_name=$1
     local project=$2
@@ -66,7 +64,8 @@ droute_send() {
     oc whoami --show-server
     trap 'oc config use-context "$original_context"' RETURN
 
-    local droute_pod_name=$(oc get pods -n droute --no-headers -o custom-columns=":metadata.name" | grep ubi9-cert-rsync)
+    # Ensure that we are only grabbing the last matched pod
+    local droute_pod_name=$(oc get pods -n droute --no-headers -o custom-columns=":metadata.name" | grep ubi9-cert-rsync | awk '{print $1}' | tail -n 1)
     local temp_droute=$(oc exec -n "${droute_project}" "${droute_pod_name}" -- /bin/bash -c "mktemp -d")
 
     ARTIFACTS_URL=$(get_artifacts_url)
@@ -111,6 +110,7 @@ droute_send() {
       echo "Attempt ${i} of ${max_attempts} to rsync test resuls to bastion pod."
       if output=$(oc rsync --progress=true --include="${metadata_output}" --include="${JUNIT_RESULTS}" --exclude="*" -n "${droute_project}" "${ARTIFACT_DIR}/${project}/" "${droute_project}/${droute_pod_name}:${temp_droute}/" 2>&1); then
         echo "$output"
+        save_status_data_router_failed "$CURRENT_DEPLOYMENT" false
         break
       elif ((i == max_attempts)); then
         echo "Failed to rsync test results after ${max_attempts} attempts."
@@ -118,7 +118,8 @@ droute_send() {
         echo "${output}"
         echo "Troubleshooting steps:"
         echo "1. Restart $droute_pod_name in $droute_project project/namespace"
-        return 1
+        save_status_data_router_failed "$CURRENT_DEPLOYMENT" true
+        return
       else
         sleep $((wait_seconds_step * i))
       fi
@@ -155,7 +156,8 @@ droute_send() {
         echo "1. Restart $droute_pod_name in $droute_project project/namespace"
         echo "2. Check the Data Router documentation: https://spaces.redhat.com/pages/viewpage.action?pageId=115488042"
         echo "3. Ask for help at Slack: #forum-dno-datarouter"
-        return 1
+        save_status_data_router_failed "$CURRENT_DEPLOYMENT" true
+        return
       else
         sleep $((wait_seconds_step * i))
       fi
@@ -165,7 +167,6 @@ droute_send() {
     if [[ "$JOB_NAME" == *periodic-* ]]; then
       local max_attempts=30
       local wait_seconds=2
-      set +e
       for ((i = 1; i <= max_attempts; i++)); do
         # Get DataRouter request information.
         DATA_ROUTER_REQUEST_OUTPUT=$(oc exec -n "${droute_project}" "${droute_pod_name}" -- /bin/bash -c "
@@ -185,12 +186,9 @@ droute_send() {
           sleep "${wait_seconds}"
         fi
       done
-      set -e
     fi
     oc exec -n "${droute_project}" "${droute_pod_name}" -- /bin/bash -c "rm -rf ${temp_droute}/*"
-    if [ -n "${PULL_NUMBER:-}" ]; then
-      set -e
-    fi
+    set -e
   ) # Close subshell
   oc config use-context "$original_context" # Restore original context
   if ! kubectl auth can-i get pods >/dev/null 2>&1; then
@@ -533,6 +531,9 @@ apply_yaml_files() {
     else
       oc apply -f "$dir/resources/topology_test/topology-test-route.yaml"
     fi
+
+    # Create secret for sealight job to pull image from private quay repository.
+    if [[ "$JOB_NAME" == *"sealight"* ]]; then kubectl create secret docker-registry quay-secret --docker-server=quay.io --docker-username=$RHDH_SEALIGHTS_BOT_USER --docker-password=$RHDH_SEALIGHTS_BOT_TOKEN --namespace="${project}"; fi
 }
 
 deploy_test_backstage_customization_provider() {
@@ -616,6 +617,8 @@ run_tests() {
   else
     echo "Yarn install completed successfully."
   fi
+
+  if [[ "$JOB_NAME" == *"sealight"* ]]; then node node_modules/sealights-playwright-plugin/importReplaceUtility.js playwright; fi
 
   yarn playwright install chromium
 
@@ -840,22 +843,61 @@ cluster_setup_k8s_helm() {
   # install_crunchy_postgres_k8s_operator # Works with K8s but disabled in values file
 }
 
-initiate_deployments() {
+install_orchestrator_infra_chart() {
+  ORCH_INFRA_NS="orchestrator-infra"
+  configure_namespace ${ORCH_INFRA_NS}
+
+  echo "Deploying orchestrator-infra chart"
+  cd "${DIR}"
+  helm upgrade -i orch-infra -n "${ORCH_INFRA_NS}" \
+    "oci://quay.io/rhdh/orchestrator-infra-chart" --version "${CHART_VERSION}" \
+    --set serverlessLogicOperator.subscription.spec.installPlanApproval=Automatic \
+    --set serverlessOperator.subscription.spec.installPlanApproval=Automatic
+}
+
+# Helper function to get common helm set parameters
+get_image_helm_set_params() {
+  local params=""
+
+  # Add image repository
+  params+="--set upstream.backstage.image.repository=${QUAY_REPO} "
+
+  # Add image tag
+  params+="--set upstream.backstage.image.tag=${TAG_NAME} "
+
+  # Add pull secrets if sealight job
+  params+=$(if [[ "$JOB_NAME" == *"sealight"* ]]; then echo "--set upstream.backstage.image.pullSecrets[0]='quay-secret'"; fi)
+  echo "${params}"
+}
+
+# Helper function to perform helm install/upgrade
+perform_helm_install() {
+  local release_name=$1
+  local namespace=$2
+  local value_file=$3
+  
+  helm upgrade -i "${release_name}" -n "${namespace}" \
+    "${HELM_CHART_URL}" --version "${CHART_VERSION}" \
+    -f "${DIR}/value_files/${value_file}" \
+    --set global.clusterRouterBase="${K8S_CLUSTER_ROUTER_BASE}" \
+    $(get_image_helm_set_params)
+}
+
+base_deployment() {
   configure_namespace ${NAME_SPACE}
 
   deploy_redis_cache "${NAME_SPACE}"
+
+  install_orchestrator_infra_chart
 
   cd "${DIR}"
   local rhdh_base_url="https://${RELEASE_NAME}-developer-hub-${NAME_SPACE}.${K8S_CLUSTER_ROUTER_BASE}"
   apply_yaml_files "${DIR}" "${NAME_SPACE}" "${rhdh_base_url}"
   echo "Deploying image from repository: ${QUAY_REPO}, TAG_NAME: ${TAG_NAME}, in NAME_SPACE: ${NAME_SPACE}"
-  helm upgrade -i "${RELEASE_NAME}" -n "${NAME_SPACE}" \
-    "${HELM_CHART_URL}" --version "${CHART_VERSION}" \
-    -f "${DIR}/value_files/${HELM_CHART_VALUE_FILE_NAME}" \
-    --set global.clusterRouterBase="${K8S_CLUSTER_ROUTER_BASE}" \
-    --set upstream.backstage.image.repository="${QUAY_REPO}" \
-    --set upstream.backstage.image.tag="${TAG_NAME}"
+  perform_helm_install "${RELEASE_NAME}" "${NAME_SPACE}" "${HELM_CHART_VALUE_FILE_NAME}"
+}
 
+rbac_deployment() {
   configure_namespace "${NAME_SPACE_POSTGRES_DB}"
   configure_namespace "${NAME_SPACE_RBAC}"
   configure_external_postgres_db "${NAME_SPACE_RBAC}"
@@ -864,12 +906,13 @@ initiate_deployments() {
   local rbac_rhdh_base_url="https://${RELEASE_NAME_RBAC}-developer-hub-${NAME_SPACE_RBAC}.${K8S_CLUSTER_ROUTER_BASE}"
   apply_yaml_files "${DIR}" "${NAME_SPACE_RBAC}" "${rbac_rhdh_base_url}"
   echo "Deploying image from repository: ${QUAY_REPO}, TAG_NAME: ${TAG_NAME}, in NAME_SPACE: ${RELEASE_NAME_RBAC}"
-  helm upgrade -i "${RELEASE_NAME_RBAC}" -n "${NAME_SPACE_RBAC}" \
-    "${HELM_CHART_URL}" --version "${CHART_VERSION}" \
-    -f "${DIR}/value_files/${HELM_CHART_RBAC_VALUE_FILE_NAME}" \
-    --set global.clusterRouterBase="${K8S_CLUSTER_ROUTER_BASE}" \
-    --set upstream.backstage.image.repository="${QUAY_REPO}" \
-    --set upstream.backstage.image.tag="${TAG_NAME}"
+  perform_helm_install "${RELEASE_NAME_RBAC}" "${NAME_SPACE_RBAC}" "${HELM_CHART_RBAC_VALUE_FILE_NAME}"
+}
+
+initiate_deployments() {
+  cd "${DIR}"
+  base_deployment
+  rbac_deployment
 }
 
 # install base RHDH deployment before upgrade
@@ -884,7 +927,7 @@ initiate_upgrade_base_deployments() {
   local rhdh_base_url="https://${RELEASE_NAME}-developer-hub-${NAME_SPACE}.${K8S_CLUSTER_ROUTER_BASE}"
   apply_yaml_files "${DIR}" "${NAME_SPACE}" "${rhdh_base_url}"
   echo "Deploying image from base repository: ${QUAY_REPO_BASE}, TAG_NAME_BASE: ${TAG_NAME_BASE}, in NAME_SPACE: ${NAME_SPACE}"
-  
+
   helm upgrade -i "${RELEASE_NAME}" -n "${NAME_SPACE}" \
     "${HELM_CHART_URL}" --version "${CHART_VERSION_BASE}" \
     -f "${DIR}/value_files/${HELM_CHART_VALUE_FILE_NAME_BASE}" \
@@ -911,7 +954,7 @@ initiate_upgrade_deployments() {
     cd "${DIR}"
 
     echo "Deploying image from repository: ${QUAY_REPO}, TAG_NAME: ${TAG_NAME}, in NAME_SPACE: ${NAME_SPACE}"
-    
+
     helm upgrade -i "${RELEASE_NAME}" -n "${NAME_SPACE}" \
     "${HELM_CHART_URL}" --version "${CHART_VERSION}" \
     -f "${DIR}/value_files/${HELM_CHART_VALUE_FILE_NAME}" \
@@ -937,12 +980,14 @@ initiate_runtime_deployment() {
   oc apply -f "$DIR/resources/postgres-db/postgres-crt-rds.yaml" -n "${namespace}"
   oc apply -f "$DIR/resources/postgres-db/postgres-cred.yaml" -n "${namespace}"
   oc apply -f "$DIR/resources/postgres-db/dynamic-plugins-root-PVC.yaml" -n "${namespace}"
+  # Create secret for sealight job to pull image from private quay repository.
+  if [[ "$JOB_NAME" == *"sealight"* ]]; then kubectl create secret docker-registry quay-secret --docker-server=quay.io --docker-username=$RHDH_SEALIGHTS_BOT_USER --docker-password=$RHDH_SEALIGHTS_BOT_TOKEN --namespace="${namespace}"; fi
+
   helm upgrade -i "${release_name}" -n "${namespace}" \
     "${HELM_CHART_URL}" --version "${CHART_VERSION}" \
     -f "$DIR/resources/postgres-db/values-showcase-postgres.yaml" \
     --set global.clusterRouterBase="${K8S_CLUSTER_ROUTER_BASE}" \
-    --set upstream.backstage.image.repository="${QUAY_REPO}" \
-    --set upstream.backstage.image.tag="${TAG_NAME}"
+    $(get_image_helm_set_params)
 }
 
 initiate_sanity_plugin_checks_deployment() {
@@ -957,8 +1002,8 @@ initiate_sanity_plugin_checks_deployment() {
     "${HELM_CHART_URL}" --version "${CHART_VERSION}" \
     -f "/tmp/${HELM_CHART_SANITY_PLUGINS_MERGED_VALUE_FILE_NAME}" \
     --set global.clusterRouterBase="${K8S_CLUSTER_ROUTER_BASE}" \
-    --set upstream.backstage.image.repository="${QUAY_REPO}" \
-    --set upstream.backstage.image.tag="${TAG_NAME}"
+    $(get_image_helm_set_params)  \
+    --set orchestrator.enabled=true
 }
 
 check_and_test() {

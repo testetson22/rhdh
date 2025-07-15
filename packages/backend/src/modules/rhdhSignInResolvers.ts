@@ -31,6 +31,42 @@ const LDAP_UUID_ANNOTATION = 'backstage.io/ldap-uuid';
  */
 export namespace rhdhSignInResolvers {
   /**
+   * A oidc resolver that looks up the user using their preferred username
+   * as the entity name
+   */
+  export const preferredUsernameMatchingUserEntityName =
+    createSignInResolverFactory({
+      optionsSchema: z
+        .object({
+          dangerouslyAllowSignInWithoutUserInCatalog: z.boolean().optional(),
+        })
+        .optional(),
+      create(options) {
+        return async (
+          info: SignInInfo<OAuthAuthenticatorResult<OidcAuthResult>>,
+          ctx,
+        ) => {
+          const userId = info.result.fullProfile.userinfo.preferred_username;
+          if (!userId) {
+            throw new Error(`OIDC user profile does not contain a username`);
+          }
+
+          return ctx.signInWithCatalogUser(
+            {
+              entityRef: { name: userId },
+            },
+            {
+              dangerousEntityRefFallback:
+                options?.dangerouslyAllowSignInWithoutUserInCatalog
+                  ? { entityRef: userId }
+                  : undefined,
+            },
+          );
+        };
+      },
+    });
+
+  /**
    * An OIDC resolver that looks up the user using their Keycloak user ID.
    */
   export const oidcSubClaimMatchingKeycloakUserId =
@@ -69,8 +105,12 @@ export namespace rhdhSignInResolvers {
             {
               entityRef: { name },
             },
-            name,
-            options?.dangerouslyAllowSignInWithoutUserInCatalog,
+            {
+              dangerousEntityRefFallback:
+                options?.dangerouslyAllowSignInWithoutUserInCatalog
+                  ? { entityRef: name }
+                  : undefined,
+            },
           );
         };
       },
@@ -80,6 +120,7 @@ export namespace rhdhSignInResolvers {
     optionsSchema: z
       .object({
         dangerouslyAllowSignInWithoutUserInCatalog: z.boolean().optional(),
+        ldapUuidKey: z.string().optional(),
       })
       .optional(),
     create(options) {
@@ -87,7 +128,8 @@ export namespace rhdhSignInResolvers {
         info: SignInInfo<OAuthAuthenticatorResult<OidcAuthResult>>,
         ctx: AuthResolverContext,
       ) => {
-        const uuid = info.result.fullProfile.userinfo.ldap_uuid as string;
+        const uuidKey = options?.ldapUuidKey ?? 'ldap_uuid';
+        const uuid = info.result.fullProfile.userinfo[uuidKey] as string;
         if (!uuid) {
           throw new Error(
             `The user profile from LDAP is missing the UUID, likely due to a misconfiguration in the provider. Please contact your system administrator for assistance.`,
@@ -101,7 +143,7 @@ export namespace rhdhSignInResolvers {
           );
         }
 
-        const uuidFromIdToken = decodeJwt(idToken)?.ldap_uuid;
+        const uuidFromIdToken = decodeJwt(idToken)?.[uuidKey];
         if (uuid !== uuidFromIdToken) {
           throw new Error(
             `There was a problem verifying your identity with LDAP due to mismatching UUID. Please contact your system administrator for assistance.`,
@@ -112,8 +154,12 @@ export namespace rhdhSignInResolvers {
           {
             annotations: { [LDAP_UUID_ANNOTATION]: uuid },
           },
-          uuid,
-          options?.dangerouslyAllowSignInWithoutUserInCatalog,
+          {
+            dangerousEntityRefFallback:
+              options?.dangerouslyAllowSignInWithoutUserInCatalog
+                ? { entityRef: uuid }
+                : undefined,
+          },
         );
       };
     },
