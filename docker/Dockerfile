@@ -15,7 +15,7 @@
 
 # Stage 1 - Build nodejs skeleton
 # https://registry.access.redhat.com/ubi9/nodejs-22
-FROM registry.access.redhat.com/ubi9/nodejs-22:9.6-1752540070 AS skeleton
+FROM registry.access.redhat.com/ubi9/nodejs-22:9.6-1753698668 AS skeleton
 # hadolint ignore=DL3002
 USER 0
 
@@ -243,8 +243,7 @@ COPY $EXTERNAL_SOURCE_NESTED/catalog-entities/marketplace /marketplace/catalog-e
 
 # Copy script to gather dynamic plugins; copy embedded dynamic plugins to root folder; fix permissions
 COPY docker/install-dynamic-plugins.py docker/install-dynamic-plugins.sh ./
-RUN chmod -R a+r ./install-dynamic-plugins.py; \
-  chmod -R a+rx ./install-dynamic-plugins.sh
+RUN chmod -R a+rx ./install-dynamic-plugins.*
 
 # The existence of the index.html.tmpl tells Backstage to take that file and load it into memory, inject the needed appConfig (instead of writing
 # it into a random *.chunk.js file, and then serve that file from memory so that we can set the readOnlyRootFilesystem: true option for
