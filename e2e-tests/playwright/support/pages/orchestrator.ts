@@ -8,16 +8,6 @@ export class Orchestrator {
     this.page = page;    
   }
 
-  async selectUserOnboardingWorkflowItem() {
-    const workflowHeader = this.page.getByRole("heading", {
-      name: "Workflows",
-    });
-    await expect(workflowHeader).toBeVisible();
-    await expect(workflowHeader).toHaveText("Workflows");
-    await expect(Workflows.workflowsTable(this.page)).toBeVisible();
-    await this.page.getByRole("link", { name: "User Onboarding" }).click();
-  }
-
   async selectGreetingWorkflowItem() {
     const workflowHeader = this.page.getByRole("heading", {
       name: "Workflows",
@@ -104,29 +94,6 @@ export class Orchestrator {
       await expect(workFlowRow.getByRole('button', { name: 'View runs' }).first()).toBeVisible();
       await expect(workFlowRow.getByRole('button', { name: 'View input schema' }).first()).toBeVisible();
       
-  }
-
-  async runUserOnboardingWorkflow(
-    userId = `user:default/${process.env.GH_USER_ID}`,
-    iterationNo = 10,
-    nameOfUser = process.env.GH_USER_ID,
-    recipients = [`user:default/${process.env.GH_USER_ID}`],
-    status = "Completed"
-  ) {
-    const runButton = this.page.getByRole('button', { name: "Run" });
-    await expect(runButton).toBeVisible();
-    await runButton.click();
-    await this.page.locator('#root_userId').fill(String(userId));
-    await this.page.locator('#root_iterationNum').fill(String(iterationNo));
-    await this.page.locator('#root_username').fill(nameOfUser);
-    await this.page.locator('#root_recipients_0').fill(recipients[0]);
-    await this.page.getByRole('button', { name: "Next" }).click();
-    await this.page.getByRole('button', { name: "Run" }).click();
-    await expect(this.page.getByText(`${status}`, { exact: true })).toBeVisible(
-      {
-        timeout: 600000,
-      }
-    );
   }
 
   async validateWorkflowRunsDetails() {
